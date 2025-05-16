@@ -1,3 +1,8 @@
-cmake-build-debug
-CMakeLists.txt
-.idea
+*
+!src/
+!test/
+!.gitignore
+!*.c
+!*.h
+!Makefile
+!README.md
