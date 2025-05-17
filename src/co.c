@@ -35,6 +35,30 @@ stack_switch_call(void *sp, void *entry, uintptr_t arg) {
     );
 }
 
+/* Coroutine */
+enum co_status {
+    CO_NEW = 1,
+    CO_RUNNING,
+    CO_WAITING,
+    CO_DEAD,
+};
+
+typedef jmp_buf co_context;
+
+#define CO_STACK_SIZE (1024 * 16) // 16KB
+#define CO_RUNTIME_STACK_SIZE (1024 * 4) // 4KB
+
+struct co {
+    char *name;
+    void (*func)(void *);
+    void *arg;
+
+    enum co_status status;
+    struct co *waiter;
+    co_context context;
+    uint8_t *stack;
+};
+
 /* List */
 struct co_node {
     struct co *co;
@@ -54,6 +78,8 @@ static void co_list_init(struct co_list *list) {
         panic("malloc struct_co_node failed");
         return;
     }
+    list->head->co = NULL;
+    list->tail->co = NULL;
     list->head->next = list->tail;
     list->head->prev = NULL;
     list->tail->next = NULL;
@@ -94,6 +120,7 @@ static void co_list_push_back(struct co_list *list, struct co *co) {
     node->next = list->tail;
     node->prev = list->tail->prev;
     list->tail->prev->next = node;
+    list->tail->prev = node;
 }
 
 static struct co* co_list_pop_front(struct co_list *list) {
@@ -121,6 +148,8 @@ static int co_list_erase(struct co_list *list, struct co *co) {
     while (1)  {
         if (node->co == NULL) return 0;
         if (node->co == co) {
+            node->prev->next = node->next;
+            node->next->prev = node->prev;
             free(node);
             return 1;
         }
@@ -128,28 +157,22 @@ static int co_list_erase(struct co_list *list, struct co *co) {
     }
 }
 
-enum co_status {
-    CO_NEW = 1,
-    CO_RUNNING,
-    CO_WAITING,
-    CO_DEAD,
-};
+__attribute__((unused))
+static void print_list(struct co_list *list) {
+    if (!co_list_inited(list)) {
+        panic("list has not been initialized");
+        return;
+    }
+    struct co_node *node = list->head->next;
+    while (node != list->tail) {
+        printf("%s ", node->co->name);
+        node = node->next;
+    }
+    printf("\n");
+}
 
-typedef jmp_buf co_context;
-
-#define CO_STACK_SIZE (1024 * 16) // 16KB
-#define CO_RUNTIME_STACK_SIZE (1024 * 4) // 4KB
-
-struct co {
-    char *name;
-    void (*func)(void *);
-    void *arg;
-
-    enum co_status status;
-    struct co *waiter;
-    co_context context;
-    uint8_t *stack;
-};
+/* Runtime support */
+static void co_wrapper(struct co *co);
 
 static struct co *co_current = NULL;
 static struct co_list co_running_list;
@@ -157,6 +180,44 @@ static struct co_list co_waiting_list;
 
 static struct co *co_main = NULL;
 static uint8_t co_runtime_stack[CO_RUNTIME_STACK_SIZE];
+
+static void co_schedule() {
+    co_current = co_list_pop_front(&co_running_list);
+    co_list_push_back(&co_running_list, co_current);
+    if (!co_current) {
+        panic("no coroutine to schedule");
+        return;
+    }
+    if (co_current->status == CO_NEW) {
+        stack_switch_call(co_current->stack + CO_STACK_SIZE, co_wrapper, (uintptr_t) co_current);
+    } else if (co_current->status == CO_RUNNING) {
+        longjmp(co_current->context, 1);
+    } else {
+//        printf("coroutine status: %d\n", co_current->status);
+        panic("invalid coroutine status");
+    }
+    panic("never reach here");
+}
+
+static void co_exit(struct co *co) {
+    co->status = CO_DEAD;
+    if (!co_list_erase(&co_running_list, co)) {
+        panic("coroutine not in running list while exiting");
+        return;
+    }
+    struct co *waiter = co->waiter;
+    if (waiter) {
+        waiter->status = CO_RUNNING;
+        if (!co_list_erase(&co_waiting_list, waiter)) {
+            panic("waiter not in waiting list while waiting");
+            return;
+        }
+        co_list_push_back(&co_running_list, waiter);
+    }
+    free(co->stack);
+    co->stack = NULL;
+    co_schedule();
+}
 
 static void co_wrapper(struct co *co) {
     co->status = CO_RUNNING;
@@ -176,39 +237,8 @@ static void co_free(struct co *co) {
     free(co);
 }
 
-static void co_schedule() {
-    co_current = co_list_pop_front(&co_running_list);
-    if (!co_current) {
-        panic("no coroutine to schedule");
-        return;
-    }
-    if (co_current->status == CO_NEW) {
-        stack_switch_call(co_current->stack + CO_STACK_SIZE, co_wrapper, (uintptr_t) co_current);
-    } else if (co_current->status == CO_RUNNING) {
-        longjmp(co_current->context, 1);
-    } else {
-        panic("invalid coroutine status");
-    }
-    panic("never reach here");
-}
-
-static void co_exit(struct co *co) {
-    co->status = CO_DEAD;
-    struct co *waiter = co->waiter;
-    if (waiter) {
-        waiter->status = CO_RUNNING;
-        if (!co_list_erase(&co_waiting_list, waiter)) {
-            panic("waiter not in waiting list while waiting");
-            return;
-        }
-        co_list_push_back(&co_running_list, waiter);
-    }
-    free(co->stack);
-    co_schedule();
-}
-
 struct co *co_start(const char *name, void (*func)(void *), void *arg) {
-    if (!name || !func) {
+    if (!name) {
         panic("name or func is NULL");
         return NULL;
     }
@@ -261,6 +291,8 @@ void co_wait(struct co *co) {
         return;
     }
     co_list_push_back(&co_waiting_list, co_current);
+//    print_list(&co_running_list);
+//    print_list(&co_waiting_list);
     co_yield();
     co_free(co); // free the resources left of coroutine
 }
