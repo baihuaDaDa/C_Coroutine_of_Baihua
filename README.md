@@ -30,21 +30,31 @@ make clean
 以下是库中提供的主要 API：
 
 ### 函数
-- **`struct co *co_start(const char *name, void (*func)(void *), void *arg);`**
-  - **描述**: 创建一个新的协程，但不会立即执行。
-  - **参数**:
-    - `name`: 协程的名称。
-    - `func`: 协程执行的函数。
-    - `arg`: 传递给协程函数的参数。
-  - **返回值**: 返回新创建的协程指针，失败时会触发 panic。
 
-- **`void co_yield();`**
-  - **描述**: 切换到另一个协程。
+#### `co_start`
+```c
+struct co *co_start(const char *name, void (*func)(void *), void *arg);
+```
+- **描述**: 创建一个新的协程，但不会立即执行。
+- **参数**:
+  - `name`: 协程的名称。
+  - `func`: 协程执行的函数。
+  - `arg`: 传递给协程函数的参数。
+- **返回值**: 返回新创建的协程指针，失败时会触发 panic。
 
-- **`void co_wait(struct co *co);`**
-  - **描述**: 等待指定的协程执行完成。
-  - **参数**:
-    - `co`: 要等待的协程。
+#### `co_yield`
+```c
+void co_yield();
+```
+- **描述**: 切换到另一个协程。
+
+#### `co_wait`
+```c
+void co_wait(struct co *co);
+```
+- **描述**: 等待指定的协程执行完成。
+- **参数**:
+  - `co`: 要等待的协程。
 
 ## 示例
 以下是如何使用该库的示例代码：
