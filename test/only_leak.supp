@@ -1,0 +1,20 @@
+{
+   Ignore invalid read/write errors
+   Memcheck:Addr4
+   fun:*
+   ...
+}
+
+{
+   Ignore conditional jump depends on uninitialised value
+   Memcheck:Cond
+   fun:*
+   ...
+}
+
+{
+   Ignore use of uninitialised value
+   Memcheck:Value4
+   fun:*
+   ...
+}

@@ -8,8 +8,14 @@ all: lib test
 lib:
 	@$(MAKE) -C $(LIB_PATH)
 
-test: lib
-	@$(MAKE) -C $(TEST_PATH)
+test:
+	@$(MAKE) -C $(TEST_PATH) test
+
+debug-32:
+	@$(MAKE) -C $(TEST_PATH) debug-32
+
+debug-64:
+	@$(MAKE) -C $(TEST_PATH) debug-64
 
 clean:
 	@$(MAKE) -C $(LIB_PATH) clean
