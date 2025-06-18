@@ -1,31 +1,43 @@
 LIB_PATH := ../src
+TESTS := unbalanced_load
 
-.PHONY: test libco
+CFLAGS := -I$(LIB_PATH)
+LDFLAGS_64 := -L$(LIB_PATH) -lco-64
+LDFLAGS_32 := -L$(LIB_PATH) -lco-32
 
-all: libco-test-64 libco-test-32
+.PHONY: all test clean debug-32 debug-64 libco
 
-test: libco all
-	@echo "==== TEST 64 bit ===="
-	@LD_LIBRARY_PATH=$(LIB_PATH) ./libco-test-64
-	@echo "==== TEST 64 bit with valgrind ===="
-	@LD_LIBRARY_PATH=$(LIB_PATH) valgrind --leak-check=summary --show-leak-kinds=definite --errors-for-leak-kinds=definite --suppressions=only_leak.supp ./libco-test-64
-	@echo "==== TEST 32 bit ===="
-	@LD_LIBRARY_PATH=$(LIB_PATH) ./libco-test-32
+all: $(addprefix bin/,$(addsuffix -64,$(TESTS))) $(addprefix bin/,$(addsuffix -32,$(TESTS)))
 
-debug-32: libco all
-	@LD_LIBRARY_PATH=$(LIB_PATH) gdb libco-test-32
+bin:
+	mkdir -p bin
 
-debug-64: libco all
-	@LD_LIBRARY_PATH=$(LIB_PATH) gdb libco-test-64
+bin/%-64: %.c | bin libco
+	gcc $(CFLAGS) -m64 $< -o $@ $(LDFLAGS_64)
+
+bin/%-32: %.c | bin libco
+	gcc $(CFLAGS) -m32 $< -o $@ $(LDFLAGS_32)
 
 libco:
 	@cd $(LIB_PATH) && make -s
 
-libco-test-64: main.c
-	gcc -I$(LIB_PATH) -L$(LIB_PATH) -m64 main.c -o libco-test-64 -lco-64
+test: all
+	@for t in $(TESTS); do \
+		echo "==== TEST $$t 64-bit ===="; \
+		LD_LIBRARY_PATH=$(LIB_PATH) ./bin/$$t-64; \
+		echo "==== VALGRIND $$t 64-bit ===="; \
+		LD_LIBRARY_PATH=$(LIB_PATH) valgrind --leak-check=summary --show-leak-kinds=definite --errors-for-leak-kinds=definite --suppressions=only_leak.supp ./bin/$$t-64; \
+		echo "==== TEST $$t 32-bit ===="; \
+		LD_LIBRARY_PATH=$(LIB_PATH) ./bin/$$t-32; \
+	done
 
-libco-test-32: main.c
-	gcc -I$(LIB_PATH) -L$(LIB_PATH) -m32 main.c -o libco-test-32 -lco-32
+debug-64: libco all
+	@echo "Choose binary to debug (one of: $(TESTS))"
+	@read BIN && LD_LIBRARY_PATH=$(LIB_PATH) gdb bin/$$BIN-64
+
+debug-32: libco all
+	@echo "Choose binary to debug (one of: $(TESTS))"
+	@read BIN && LD_LIBRARY_PATH=$(LIB_PATH) gdb bin/$$BIN-32
 
 clean:
-	rm -f libco-test-*
+	rm -rf bin
