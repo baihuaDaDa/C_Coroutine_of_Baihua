@@ -2,6 +2,7 @@
 #define COROUTINE_C_LIST_H
 
 #include "lang_items.h"
+#include <stdint.h>
 
 /* List */
 struct node {
@@ -13,8 +14,10 @@ struct node {
 struct list {
     struct node *head;
     struct node *tail;
+    uint64_t size;
 };
 
+__attribute__((unused))
 void list_init(struct list *list) {
     list->head = (struct node *) malloc(sizeof(struct node));
     list->tail = (struct node *) malloc(sizeof(struct node));
@@ -28,8 +31,10 @@ void list_init(struct list *list) {
     list->head->prev = NULL;
     list->tail->next = NULL;
     list->tail->prev = list->head;
+    list->size = 0;
 }
 
+__attribute__((unused))
 int list_inited(struct list *list) {
     if (!list || !list->head || !list->tail) {
         return 0;
@@ -37,6 +42,7 @@ int list_inited(struct list *list) {
     return 1;
 }
 
+__attribute__((unused))
 void list_destroy(struct list *list) {
     if (!list) {
         panic("list is NULL");
@@ -50,6 +56,16 @@ void list_destroy(struct list *list) {
     }
 }
 
+__attribute__((unused))
+int list_is_empty(struct list *list) {
+    if (!list_inited(list)) {
+        panic("list has not been initialized");
+        return 0;
+    }
+    return list->size == 0;
+}
+
+__attribute__((unused))
 void list_push_back(struct list *list, void *co) {
     if (!list_inited(list)) {
         panic("list has not been initialized");
@@ -65,24 +81,28 @@ void list_push_back(struct list *list, void *co) {
     node->prev = list->tail->prev;
     list->tail->prev->next = node;
     list->tail->prev = node;
+    list->size++;
 }
 
+__attribute__((unused))
 void *list_pop_front(struct list *list) {
     if (!list_inited(list)) {
         panic("list has not been initialized");
         return NULL;
     }
     struct node *node = list->head->next;
-    if (node == list->tail) {
+    if (!list->size) {
         return NULL;
     }
     list->head->next = node->next;
     node->next->prev = list->head;
     void *co = node->data;
     free(node);
+    list->size--;
     return co;
 }
 
+__attribute__((unused))
 int list_erase(struct list *list, void *co) {
     if (!list_inited(list)) {
         panic("list has not been initialized");
@@ -95,6 +115,7 @@ int list_erase(struct list *list, void *co) {
             node->prev->next = node->next;
             node->next->prev = node->prev;
             free(node);
+            list->size--;
             return 1;
         }
         node = node->next;

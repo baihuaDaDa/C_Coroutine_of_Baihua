@@ -1,6 +1,9 @@
 #ifndef COROUTINE_C_CO_H
 #define COROUTINE_C_CO_H
 
+/// @brief Initialize the coroutine library.
+void co_init();
+
 /** @brief Create a new coroutine (but not execute it at once).
   * @param name The name of the coroutine.
   * @param func The function to be executed.
