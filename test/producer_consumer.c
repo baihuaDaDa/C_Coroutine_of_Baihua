@@ -1,6 +1,6 @@
 #include <stdio.h>
 #include <stdint.h>
-#include "../src/co.h"
+#include <co.h>
 
 #define BUF_SIZE 10
 #define N_PRODUCE 100
