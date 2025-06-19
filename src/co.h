@@ -20,4 +20,26 @@ void co_yield();
   */
 void co_wait(struct co *co);
 
+/** @brief Create a semaphore.
+  * @param value The initial value of the semaphore.
+  * @return A pointer to the initialized semaphore.
+  */
+struct co_sem *co_sem_create(unsigned int value);
+
+/** @brief Wait on a semaphore. This function will block if the semaphore value is zero.
+  * @param sem The semaphore to wait on.
+  */
+void co_sem_wait(struct co_sem *sem);
+
+/** @brief Post (signal) a semaphore, releasing it. This function will wake up one coroutine waiting on the semaphore.
+  * @param sem The semaphore to post.
+  */
+void co_sem_post(struct co_sem *sem);
+
+/** @brief Destroy a semaphore, freeing its resources.
+  *        User needs to free all the created semaphores before exiting the program, or memory leaks would occur.
+  * @param sem The semaphore to destroy.
+  */
+void co_sem_destroy(struct co_sem *sem);
+
 #endif //COROUTINE_C_CO_H

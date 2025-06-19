@@ -10,6 +10,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <semaphore.h>
+#include <sys/param.h>
 
 static inline void
 stack_switch_call(void *sp, void *entry, uintptr_t arg) {
@@ -36,7 +37,7 @@ stack_switch_call(void *sp, void *entry, uintptr_t arg) {
 #define CO_STACK_SIZE (1024 * 16) // 16KB
 #define CO_RUNTIME_STACK_SIZE (1024 * 4) // 4KB
 #define RUN_QUEUE_SIZE 256
-#define M_NUM 16
+#define M_NUM 24
 
 /* Coroutine */
 enum co_status {
@@ -46,12 +47,20 @@ enum co_status {
     CO_DEAD,
 };
 
+enum co_trap_id {
+    CO_SCHEDULE,
+    CO_YIELD,
+    CO_EXIT,
+    CO_WAIT,
+    CO_SEM_WAIT,
+};
+
 typedef jmp_buf co_context;
 
 struct loop_queue {
     struct g *inner[RUN_QUEUE_SIZE];
-    uint64_t head;
-    uint64_t tail;
+    uint head;
+    uint tail;
 };
 
 struct mutex_queue {
@@ -85,9 +94,17 @@ struct m {
 
 struct p {
     struct co *to_be_waited;
+    struct co_sem *blocked_sem;
     struct loop_queue all_queue;
     struct loop_queue running_queue;
     struct loop_queue dead_queue;
+};
+
+/* Semaphore */
+struct co_sem {
+    uint count;
+    struct list waiters;
+    pthread_mutex_t mutex;
 };
 
 /* Debug */
@@ -113,6 +130,7 @@ static pthread_key_t tls_key_g_current;
 static struct co *co_main = NULL;
 static sem_t co_main_sem;
 static int exit_signal = 0;
+static atomic_int co_num = 0;
 /* ----------------------------- */
 
 static void g_destroy(struct g *g);
@@ -121,20 +139,22 @@ static struct m *m_get_current();
 static void *m_run_coroutine(void *ptr);
 static void p_init(struct p *p);
 static void p_destroy(struct p *p);
+static void p_running_push(struct m *m_current, struct p *p_current, struct g *g);
+static struct g *p_running_pop(struct m *m_current, struct p *p_current);
 static void mq_init(struct mutex_queue *mq);
 static void mq_destroy(struct mutex_queue *mq);
 static struct list *mq_get(struct mutex_queue *mq);
 static void mq_free(struct mutex_queue *mq);
 static int queue_push(struct loop_queue *q, struct g *g);
 static struct g *queue_pop(struct loop_queue *q);
-static int queue_is_empty(struct loop_queue *q);
+static uint queue_size(struct loop_queue *q);
 
 static struct co *co_new(const char *name, void (*func)(void *), void *arg, struct g *g);
 static void co_wrapper(struct co *co);
 static void co_free(struct co *co);
 
 static int queue_push(struct loop_queue *q, struct g *g) {
-    uint64_t new_tail = (q->tail + 1) % RUN_QUEUE_SIZE;
+    uint new_tail = (q->tail + 1) % RUN_QUEUE_SIZE;
     if (new_tail == q->head) return 0;
     q->inner[q->tail] = g;
     q->tail = new_tail;
@@ -148,8 +168,8 @@ static struct g *queue_pop(struct loop_queue *q) {
     return g;
 }
 
-static int queue_is_empty(struct loop_queue *q) {
-    return q->head == q->tail;
+static uint queue_size(struct loop_queue *q) {
+    return (q->tail + RUN_QUEUE_SIZE - q->head) % RUN_QUEUE_SIZE;
 }
 
 static void g_destroy(struct g *g) {
@@ -168,9 +188,45 @@ static void p_init(struct p *p) {
 
 static void p_destroy(struct p *p) {
     struct loop_queue *q = &p->all_queue;
-    for (uint64_t i = q->head; i != q->tail; i = (i + 1) % RUN_QUEUE_SIZE) {
+    for (uint i = q->head; i != q->tail; i = (i + 1) % RUN_QUEUE_SIZE) {
         g_destroy(q->inner[i]);
     }
+}
+
+static void p_running_push(struct m *m_current, struct p *p_current, struct g *g) {
+    uint size = queue_size(&p_current->running_queue);
+    uint target_size = MIN((atomic_load_explicit(&co_num, memory_order_acquire) + M_NUM - 1) / M_NUM, RUN_QUEUE_SIZE - 1);
+    if (target_size != 0 && size > (target_size << 1)) {
+        struct list *gq_inner = mq_get(&global_queue);
+        while (size > target_size - 1) {
+            struct g *g_push = queue_pop(&p_current->running_queue);
+            g_push->m = NULL;
+            list_push_back(gq_inner, g_push);
+            size--;
+        }
+        mq_free(&global_queue);
+    }
+    g->m = m_current;
+    if (!queue_push(&p_current->running_queue, g)) {
+        panic("running queue is still full after balancing overhead");
+    }
+}
+
+static struct g *p_running_pop(struct m *m_current, struct p *p_current) {
+    uint size = queue_size(&p_current->running_queue);
+    uint target_size = MIN((atomic_load_explicit(&co_num, memory_order_acquire) + M_NUM - 1) / M_NUM, RUN_QUEUE_SIZE - 1);
+    if (size < ((target_size + 1) >> 1)) {
+        struct list *gq_inner = mq_get(&global_queue);
+        while (size < target_size) {
+            struct g *g_pop = list_pop_front(gq_inner);
+            if (!g_pop) break;
+            g_pop->m = m_current;
+            queue_push(&p_current->running_queue, g_pop);
+            size++;
+        }
+        mq_free(&global_queue);
+    }
+    return queue_pop(&p_current->running_queue);
 }
 
 static void mq_init(struct mutex_queue *mq) {
@@ -217,23 +273,14 @@ static void *m_run_coroutine(void *ptr) {
     struct m *m_current = g0->m;
     struct p *p_current = m_current->p;
     // schedule
-    int val = 0;
+    int val = CO_SCHEDULE;
     while (!atomic_load_explicit(&exit_signal, memory_order_acquire)) {
-        if (val == 0) { // run next
-            struct g *g_next = NULL;
-            if (!queue_is_empty(&p_current->running_queue)) {
-//                printf("get next coroutine from local queue\n");
-                g_next = queue_pop(&p_current->running_queue);
-            } else {
-                struct list *gq_inner = mq_get(&global_queue);
-                if (!list_is_empty(gq_inner)) {
-//                    printf("get next coroutine from global queue\n");
-                    g_next = (struct g *) list_pop_front(gq_inner);
-                }
-                mq_free(&global_queue);
-            }
+        if (val == CO_SCHEDULE) { // run next
+            struct g *g_next = p_running_pop(m_current, p_current);
             if (g_next) {
-                g_next->m = m_current; // set current m
+                if (g_next->m != m_current) {
+                    panic("g_next's m is not current m");
+                }
                 *tls_data_g_current = g_next;
                 struct co *co_current = g_next->co;
                 val = setjmp(g0->co->context);
@@ -251,18 +298,13 @@ static void *m_run_coroutine(void *ptr) {
                     continue;
                 }
             }
-        } else if (val == 1) { // suspend
+        } else if (val == CO_YIELD) { // suspend
 //            printf("suspend coroutine\n");
             struct g *g_current = *tls_data_g_current;
-            if (!queue_push(&p_current->running_queue, g_current)) {
-                struct list *gq_inner = mq_get(&global_queue);
-                list_push_back(gq_inner, g_current);
-                g_current->m = NULL;
-                mq_free(&global_queue);
-            }
+            p_running_push(m_current, p_current, g_current);
             *tls_data_g_current = g0;
-            val = 0;
-        } else if (val == 2) { // exit
+            val = CO_SCHEDULE;
+        } else if (val == CO_EXIT) { // exit
             struct g *g_current = *tls_data_g_current;
             struct co *co = g_current->co;
             // erase from running list and free stack
@@ -294,8 +336,8 @@ static void *m_run_coroutine(void *ptr) {
             }
             pthread_mutex_unlock(&co->status_mutex);
             *tls_data_g_current = g0;
-            val = 0;
-        } else { // wait
+            val = CO_SCHEDULE;
+        } else if (val == CO_WAIT) { // wait
             struct g *g_current = *tls_data_g_current;
             struct co *co_current = g_current->co, *to_be_waited = p_current->to_be_waited;
             // add to waiters
@@ -313,7 +355,19 @@ static void *m_run_coroutine(void *ptr) {
             pthread_mutex_unlock(&co_current->status_mutex);
             pthread_mutex_unlock(&to_be_waited->status_mutex);
             *tls_data_g_current = g0;
-            val = 0;
+            val = CO_SCHEDULE;
+        } else { // sem_wait
+            struct g *g_current = *tls_data_g_current;
+            struct co *co_current = g_current->co;
+            struct co_sem *sem = p_current->blocked_sem;
+            g_current->m = NULL;
+            list_push_back(&sem->waiters, co_current);
+            pthread_mutex_lock(&co_current->status_mutex);
+            co_current->status = CO_WAITING;
+            pthread_mutex_unlock(&co_current->status_mutex);
+            pthread_mutex_unlock(&sem->mutex);
+            *tls_data_g_current = g0;
+            val = CO_SCHEDULE;
         }
     }
 //    free(tls_data_g_current);
@@ -324,7 +378,8 @@ static void co_wrapper(struct co *co) {
     co->status = CO_RUNNING;
     co->func(co->arg);
 //    stack_switch_call(co_runtime_stack + CO_RUNTIME_STACK_SIZE, co_exit, (uintptr_t) co);
-    longjmp(m_get_current()->g0->co->context, 2); // exit coroutine
+    atomic_fetch_sub_explicit(&co_num, 1, memory_order_acq_rel);
+    longjmp(m_get_current()->g0->co->context, CO_EXIT); // exit coroutine
 }
 
 static void co_free(struct co *co) {
@@ -337,6 +392,7 @@ static void co_free(struct co *co) {
         co->name = NULL;
     }
     list_destroy(&co->waiters);
+    pthread_mutex_destroy(&co->status_mutex);
     free(co);
 }
 
@@ -364,31 +420,33 @@ struct co *co_new(const char *name, void (*func)(void *), void *arg, struct g *g
     }
     co->func = func;
     co->arg = arg;
+    co->status = CO_NEW;
+    list_init(&co->waiters);
     co->status_mutex = (pthread_mutex_t) PTHREAD_MUTEX_INITIALIZER;
     int result = pthread_mutex_init(&co->status_mutex, NULL);
     if (result != 0) {
+        co_free(co);
         panic("init global queue mutex failed");
         return NULL;
     }
-    co->status = CO_NEW;
-    list_init(&co->waiters);
     return co;
 }
 
 struct co *co_start(const char *name, void (*func)(void *), void *arg) {
 //    printf("co_start\n");
     struct m *m_current = m_get_current();
+    struct p *p_current = m_current->p;
     struct g *g = malloc(sizeof(struct g));
     struct co * co = co_new(name, func, arg, g);
     g->co = co;
-    queue_push(&m_current->p->all_queue, g);
+    atomic_fetch_add_explicit(&co_num, 1, memory_order_acq_rel);
+    queue_push(&p_current->all_queue, g);
     if (m_current == &m_set[0]) { // main thread
         struct list *gq_inner = mq_get(&global_queue);
         list_push_back(gq_inner, g);
         mq_free(&global_queue);
     } else { // other thread
-        g->m = m_current;
-        queue_push(&m_current->p->running_queue, g);
+        p_running_push(m_current, p_current, g);
     }
     return co;
 }
@@ -399,7 +457,7 @@ void co_yield() {
     if (g_current->co == co_main) return; // do not yield in main coroutine
     int val = setjmp(g_current->co->context);
     if (val == 0) { // suspend
-        longjmp(g_current->m->g0->co->context, 1); // jump to scheduler
+        longjmp(g_current->m->g0->co->context, CO_YIELD); // jump to scheduler
     } else { // resume
         return;
     }
@@ -428,7 +486,7 @@ void co_wait(struct co *co) {
     m_current->p->to_be_waited = co;
     int val = setjmp(g_current->co->context);
     if (val == 0) {
-        longjmp(m_current->g0->co->context, 3); // jump to scheduler
+        longjmp(m_current->g0->co->context, CO_WAIT); // jump to scheduler
     } else { // resume
         return;
     }
@@ -464,6 +522,87 @@ void co_init() {
         m_set[i].g0->co = co_new("co_run_coroutine", NULL, NULL, m_set[i].g0);
         pthread_create(&m_set[i].thread_id, NULL, m_run_coroutine, m_set[i].g0);
     }
+}
+
+struct co_sem *co_sem_create(uint value) {
+    struct co_sem *sem = (struct co_sem *) malloc(sizeof(struct co_sem));
+    if (!sem) {
+        panic("malloc struct co_sem failed");
+        return NULL;
+    }
+    sem->count = value;
+    sem->mutex = (pthread_mutex_t) PTHREAD_MUTEX_INITIALIZER;
+    int result = pthread_mutex_init(&sem->mutex, NULL);
+    if (result != 0) {
+        free(sem);
+        panic("init semaphore mutex failed");
+        return NULL;
+    }
+    list_init(&sem->waiters);
+    return sem;
+}
+
+void co_sem_wait(struct co_sem *sem) {
+    pthread_mutex_lock(&sem->mutex);
+    if (sem->count == 0) {
+        struct g *g_current = g_get_current();
+        struct m *m_current = g_current->m;
+        struct co *co_current = g_current->co;
+        if (co_current == co_main) { // main coroutine blocked by semaphore
+            list_push_back(&sem->waiters, co_main);
+            pthread_mutex_unlock(&sem->mutex);
+            sem_wait(&co_main_sem);
+            return;
+        }
+        m_current->p->blocked_sem = sem;
+        int val = setjmp(co_current->context);
+        if (val == 0) { // suspend
+            longjmp(m_current->g0->co->context, CO_SEM_WAIT);
+        } else { // resume
+            return;
+        }
+    } else {
+        sem->count--;
+        pthread_mutex_unlock(&sem->mutex);
+        return;
+    }
+}
+
+void co_sem_post(struct co_sem *sem) {
+    pthread_mutex_lock(&sem->mutex);
+    if (list_is_empty(&sem->waiters)) {
+        sem->count++;
+        pthread_mutex_unlock(&sem->mutex);
+        return;
+    } else {
+        struct co *waiter = (struct co *) list_pop_front(&sem->waiters);
+        pthread_mutex_unlock(&sem->mutex);
+        if (waiter == co_main) {
+            sem_post(&co_main_sem); // wake up main coroutine
+            return;
+        }
+        pthread_mutex_lock(&waiter->status_mutex);
+        if (waiter->status == CO_WAITING) {
+            waiter->status = CO_RUNNING;
+            pthread_mutex_unlock(&waiter->status_mutex);
+            struct g *g_waiter = waiter->g;
+            struct m *m_current = m_get_current();
+            p_running_push(m_current, m_current->p, g_waiter);
+        } else {
+            pthread_mutex_unlock(&waiter->status_mutex);
+            panic("co_sem's waiter status is not CO_WAITING");
+        }
+    }
+}
+
+void co_sem_destroy(struct co_sem *sem) {
+    if (!sem) {
+        panic("semaphore is NULL");
+        return;
+    }
+    pthread_mutex_destroy(&sem->mutex);
+    list_destroy(&sem->waiters);
+    free(sem);
 }
 
 __attribute__((destructor))
