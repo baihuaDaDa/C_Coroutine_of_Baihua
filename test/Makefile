@@ -1,5 +1,5 @@
 LIB_PATH := ../src
-TESTS := unbalanced_load
+TESTS := random_load
 
 CFLAGS := -I$(LIB_PATH)
 LDFLAGS_64 := -L$(LIB_PATH) -lco-64

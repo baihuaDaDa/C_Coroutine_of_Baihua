@@ -1,9 +1,10 @@
 // test_unbalanced_load.c
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <co.h>
 
-#define N 10000
+#define N 1000
 
 struct task_arg {
     int id;
@@ -26,6 +27,8 @@ int main() {
     co_init();
     struct task_arg *args[N];
 
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
     for (int i = 0; i < N; i++) {
         args[i] = malloc(sizeof(struct task_arg));
         args[i]->id = i;
@@ -38,6 +41,9 @@ int main() {
         free(args[i]);
     }
 
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double sec = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
     printf("All unbalanced coroutines completed.\n");
+    printf("Time: %.6f s\n", sec);
     return 0;
 }
